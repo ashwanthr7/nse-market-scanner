@@ -346,45 +346,6 @@ class MainActivity : AppCompatActivity() {
         marketContainer.addView(marketResultsContainer)
     }
 
-    private fun scanFullMarket() {
-        val conditions = selectedBuiltInConditions()
-        if (conditions.isEmpty()) {
-            toast("Select at least one Delivery Ratio condition.")
-            return
-        }
-        val range = selectedMarketRange()
-        marketScanButton.isEnabled = false
-        marketProgressText.visibility = View.VISIBLE
-        marketProgressText.text = "Loading NSE equity universe…"
-        marketResultsContainer.removeAllViews()
-        background.submit {
-            try {
-                val symbols = latestUniverse()
-                if (symbols.isEmpty()) throw IllegalStateException("Unable to load NSE equity universe. Please try again.")
-                runOnUiThread { marketProgressText.text = "Calculating Delivery Ratio for ${symbols.size} stocks…" }
-                val results = calculateAll(symbols, range.first, range.second) { done, total ->
-                    runOnUiThread { marketProgressText.text = "Fetching NSE data: $done / $total dates" }
-                }
-                runOnUiThread {
-                    marketScanButton.isEnabled = true
-                    marketProgressText.visibility = View.GONE
-                    renderMarketResults(results, range.first, range.second, conditions, symbols.size)
-                }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    marketScanButton.isEnabled = true
-                    marketProgressText.visibility = View.GONE
-                    marketResultsContainer.removeAllViews()
-                    marketResultsContainer.addView(TextView(this).apply {
-                        text = "Scanner failed\n\n${e.message ?: "Unable to scan market"}"
-                        textSize = 15f
-                        setPadding(dp(8), dp(14), dp(8), dp(14))
-                    })
-                }
-            }
-        }
-    }
-
     private fun selectedMarketRange(): Pair<Calendar, Calendar> {
         val end = Calendar.getInstance().apply { set(Calendar.HOUR_OF_DAY,0); set(Calendar.MINUTE,0); set(Calendar.SECOND,0); set(Calendar.MILLISECOND,0) }
         val start = end.clone() as Calendar
