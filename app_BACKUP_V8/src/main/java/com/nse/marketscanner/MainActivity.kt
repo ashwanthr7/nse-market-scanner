@@ -5,6 +5,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.Intent
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
@@ -61,7 +62,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var marketScanButton: MaterialButton
     private lateinit var marketProgressText: TextView
     private lateinit var marketResultsContainer: LinearLayout
+    private lateinit var fundamentalChecks: MutableList<CheckBox>
+    private lateinit var sectorChecks: MutableList<CheckBox>
+    private lateinit var screenerStatus: TextView
+    private lateinit var marketLensQuery: AutoCompleteTextView
+    private var screenerFundamentals: Map<String, Fundamental> = emptyMap()
+    private val sectorCache = mutableMapOf<String, String>()
+    private val sectorPool = Executors.newFixedThreadPool(6)
     private val scannerPrefs: SharedPreferences by lazy { getSharedPreferences("market_scanner", MODE_PRIVATE) }
+    private val PICK_SCREENER = 7101
 
     private var fromDate: Calendar? = null
     private var toDate: Calendar? = null
@@ -73,6 +82,8 @@ class MainActivity : AppCompatActivity() {
         SimpleDateFormat("yyyy-MM-dd", Locale.US)
     )
     private val background = Executors.newSingleThreadExecutor()
+    private val marketLensCookies = CookieManager(null, CookiePolicy.ACCEPT_ALL)
+    private var marketLensAction: String? = null
     private val datePool = Executors.newFixedThreadPool(4)
     private val prefs: SharedPreferences by lazy { getSharedPreferences("delivery_ratio", MODE_PRIVATE) }
     private val savedSymbols1 = linkedSetOf<String>()
@@ -86,6 +97,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         background.shutdownNow()
         datePool.shutdownNow()
+        sectorPool.shutdownNow()
         super.onDestroy()
     }
 
@@ -100,7 +112,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(4), dp(5), dp(4), 0)
         }, LinearLayout.LayoutParams(-1, dp(48)))
         outer.addView(TextView(this).apply {
-            text = "Fast native scanner • Delivery Ratio"
+            text = "Fast native scanner • NSE sectors + Delivery Ratio"
             textSize = 13.5f; setPadding(dp(4), 0, dp(4), dp(7))
         })
         scroll = ScrollView(this).apply { isFillViewport = true }
@@ -323,7 +335,7 @@ class MainActivity : AppCompatActivity() {
             text = "Market Scanner"; textSize = 23f; setTypeface(null, android.graphics.Typeface.BOLD)
         })
         marketContainer.addView(TextView(this).apply {
-            text = "NSE Delivery Ratio"
+            text = "NSE sectors → Delivery Ratio"
             textSize = 13f; setPadding(0, dp(4), 0, dp(12))
         })
 
@@ -338,6 +350,17 @@ class MainActivity : AppCompatActivity() {
             marketConditionChecks.add(CheckBox(this).apply { text=t; textSize=15f; isChecked=i==2; setPadding(dp(4),0,0,0) }.also { marketContainer.addView(it, LinearLayout.LayoutParams(-1, dp(44))) })
         }
 
+        marketContainer.addView(label("NSE Sectors (official 22-sector classification)").apply { setPadding(0, dp(8), 0, dp(2)) })
+        val sectorPanel = LinearLayout(this).apply { orientation=LinearLayout.VERTICAL; visibility=View.GONE; setPadding(dp(4),dp(2),dp(4),dp(4)) }
+        val sectorToggle = MaterialButton(this).apply { text="OPEN"; textSize=13f; setOnClickListener { val open=sectorPanel.visibility!=View.VISIBLE; sectorPanel.visibility=if(open) View.VISIBLE else View.GONE; text=if(open) "CLOSE" else "OPEN" } }
+        marketContainer.addView(sectorToggle, LinearLayout.LayoutParams(-1, dp(44)))
+        sectorChecks=mutableListOf()
+        val sectors=listOf("Automobile and Auto Components","Capital Goods","Chemicals","Construction Materials","Metals & Mining","Forest Materials","Consumer Durables","Textiles","Media, Entertainment & Publication","Realty","Consumer Services","Oil, Gas & Consumable Fuels","Fast Moving Consumer Goods","Financial Services","Healthcare","Construction","Information Technology","Services","Telecommunication","Power","Utilities","Diversified")
+        sectors.forEach { sector ->
+            sectorChecks.add(CheckBox(this).apply { text=sector; textSize=14f; isChecked=sector!="Healthcare" && sector!="Oil, Gas & Consumable Fuels"; setPadding(dp(4),0,0,0) }.also { sectorPanel.addView(it, LinearLayout.LayoutParams(-1, dp(40))) })
+        }
+        marketContainer.addView(sectorPanel, LinearLayout.LayoutParams(-1,-2))
+
         marketScanButton=MaterialButton(this).apply { text="SCAN MARKET"; textSize=16f; setOnClickListener { scanFullMarket() } }
         marketContainer.addView(marketScanButton, LinearLayout.LayoutParams(-1,dp(54)).apply { topMargin=dp(8) })
         marketProgressText=TextView(this).apply { textSize=12f; gravity=Gravity.CENTER; visibility=View.GONE }
@@ -345,6 +368,406 @@ class MainActivity : AppCompatActivity() {
         marketResultsContainer=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL }
         marketContainer.addView(marketResultsContainer)
     }
+
+    private fun insertMarketLensToken(token: String) {
+        if (!::marketLensQuery.isInitialized) return
+        try {
+            marketLensQuery.requestFocus()
+            val text = marketLensQuery.text ?: return
+            val start = marketLensQuery.selectionStart.let { if (it < 0) text.length else it }.coerceIn(0, text.length)
+            val end = marketLensQuery.selectionEnd.let { if (it < 0) start else it }.coerceIn(start, text.length)
+            val left = text.subSequence(0, start).toString()
+            val right = text.subSequence(end, text.length).toString()
+            val needsBefore = left.isNotEmpty() && !left.last().isWhitespace()
+            val needsAfter = right.isNotEmpty() && !right.first().isWhitespace()
+            val inserted = (if (needsBefore) " " else "") + token + (if (needsAfter) " " else "")
+            text.replace(start, end, inserted)
+            marketLensQuery.setSelection((start + inserted.length).coerceIn(0, text.length))
+            marketLensQuery.dismissDropDown()
+        } catch (_: Exception) {
+            // Keep the scanner open even if the text field loses selection/focus.
+        }
+    }
+
+    private fun replaceCurrentQueryToken(token: String) {
+        if (!::marketLensQuery.isInitialized) return
+        val editable = marketLensQuery.editableText ?: return
+        val cursor = marketLensQuery.selectionStart.coerceAtLeast(0).coerceAtMost(editable.length)
+        val before = editable.substring(0, cursor)
+        val after = editable.substring(cursor)
+        val tokenStart = before.lastIndexOfAny(charArrayOf(' ', '\n', '\t')).let { if (it < 0) 0 else it + 1 }
+        val left = before.substring(0, tokenStart)
+        val needsBefore = left.isNotEmpty() && !left.last().isWhitespace()
+        val needsAfter = after.isNotEmpty() && !after.first().isWhitespace()
+        val replacement = (if (needsBefore) " " else "") + token + (if (needsAfter) " " else "")
+        editable.replace(tokenStart, cursor, replacement)
+        marketLensQuery.setSelection((tokenStart + replacement.length).coerceAtMost(editable.length))
+        marketLensQuery.requestFocus()
+        marketLensQuery.dismissDropDown()
+    }
+
+    private fun normalizeMarketLensQueryForSubmit(raw: String): String {
+        var q = raw.replace('\n', ' ').replace('\r', ' ').replace(Regex("\\s+"), " ").trim()
+        // Market Lens expects the Field Operator Value form with spaces around operators.
+        q = q.replace(Regex("\\s*(>=|<=|>|<|=)\\s*"), " $1 ")
+            .replace(Regex("\\s+"), " ").trim()
+        // Canonicalize the names users commonly type into the query box.
+        q = Regex("(?i)\\bmarket cap\\b").replace(q, "Market Cap (in Cr)")
+        q = Regex("(?i)\\bprice to earning(?:s)?\\s*\\(\\s*p/e\\s*\\)").replace(q, "Price to Earning (P/E)")
+        q = Regex("(?i)\\bpe ratio\\b").replace(q, "PE Ratio")
+        q = Regex("(?i)\\bdebt to equity\\b").replace(q, "Debt to Equity")
+        q = Regex("(?i)\\broce\\b").replace(q, "ROCE")
+        q = Regex("(?i)\\broe\\b").replace(q, "ROE")
+        q = Regex("(?i)\\bdebt\\s*/\\s*eq(?:uity)?\\b").replace(q, "Debt / Eq")
+        q = Regex("(?i)\\brev growth\\b").replace(q, "Rev Growth")
+        q = Regex("(?i)\\bpb ratio\\b").replace(q, "PB Ratio")
+        q = Regex("(?i)\\bdiv yield\\b").replace(q, "Div Yield")
+        val unsupported = listOf("interest coverage", "interest coverage ratio", "pledge percentage", "pledged percentage", "pledge %", "pledge")
+        if (unsupported.any { q.contains(it, ignoreCase = true) }) {
+            throw IllegalArgumentException("NSE Market Lens does not currently accept Interest Coverage or Pledge as query fields. Remove those conditions and use the Market Lens-supported fields.")
+        }
+        return q
+    }
+
+    private fun scanFullMarket() {
+        val range=selectedMarketRange(); val conditions=selectedBuiltInConditions()
+        if (conditions.isEmpty()) { toast("Select at least one Delivery Ratio condition."); return }
+        val selected=selectedSectors()
+        if (selected.isEmpty()) { toast("Select at least one NSE sector."); return }
+        marketScanButton.isEnabled=false; marketProgressText.visibility=View.VISIBLE; marketResultsContainer.removeAllViews()
+        background.submit {
+            try {
+                runOnUiThread { marketProgressText.text="Loading NSE equity universe…" }
+                val universe = latestUniverse()
+                if (universe.isEmpty()) throw IllegalStateException("Could not load the NSE equity universe.")
+                runOnUiThread { marketProgressText.text="Checking NSE sectors for ${universe.size} stocks…" }
+                val sectorFiltered=filterByNseSectors(universe,selected)
+                if (sectorFiltered.isEmpty()) throw IllegalStateException("No stocks passed the selected NSE sector filters.")
+                runOnUiThread { marketProgressText.text="${sectorFiltered.size} stocks passed sectors • scanning Delivery Ratio…" }
+                val results=calculateAll(sectorFiltered,range.first,range.second) { done,total -> runOnUiThread { marketProgressText.text="Scanning ${sectorFiltered.size} stocks • NSE days $done / $total" } }.filter { it.days>0 && it.error==null }
+                runOnUiThread { marketScanButton.isEnabled=true; marketProgressText.visibility=View.GONE; renderMarketResults(results,range.first,range.second,conditions,sectorFiltered.size,null) }
+            } catch(e:Exception) {
+                runOnUiThread { marketScanButton.isEnabled=true; marketProgressText.visibility=View.GONE; marketResultsContainer.removeAllViews(); marketResultsContainer.addView(TextView(this).apply { text="Scanner failed\n\n${e.message ?: "Unknown error"}"; textSize=16f; setPadding(dp(8),dp(16),dp(8),dp(16)) }) }
+            }
+        }
+    }
+
+    private fun extractMarketLensSymbol(obj: JSONObject): String? {
+        val names = listOf("symbol", "Symbol", "SYMBOL", "ticker", "Ticker", "nseSymbol", "NSE Symbol", "nse_code", "NSE Code")
+        for (name in names) {
+            val s = obj.optString(name, "").trim().uppercase(Locale.US)
+            if (s.isNotEmpty()) return s
+        }
+        return null
+    }
+
+    private data class Fundamental(
+        val debtEquity: Double? = null,
+        val interestCoverage: Double? = null,
+        val roce: Double? = null,
+        val pledgePct: Double? = null,
+        val sector: String? = null
+    )
+    private data class FundamentalSummary(val bySymbol: Map<String, Fundamental>, val passedCount: Int)
+    private data class FundamentalSelection(val de: Boolean, val ic: Boolean, val roce: Boolean, val pledge: Boolean)
+
+    private fun selectedFundamentalFilters(): FundamentalSelection = FundamentalSelection(
+        fundamentalChecks.getOrNull(0)?.isChecked == true,
+        fundamentalChecks.getOrNull(1)?.isChecked == true,
+        fundamentalChecks.getOrNull(2)?.isChecked == true,
+        fundamentalChecks.getOrNull(3)?.isChecked == true
+    )
+
+    private fun selectedSectors(): Set<String> = sectorChecks.filter { it.isChecked }.map { it.text.toString() }.toSet()
+
+    /**
+     * Fetch annual corporate financial results once for the whole NSE equity universe.
+     * The NSE endpoint is used as a bulk catalogue; values are read from rows/objects
+     * that expose annual debt-equity and interest-coverage fields.
+     */
+    /**
+     * Fetch annual/shareholding fundamentals from NSE Market Lens.
+     * The old /api/corporates-financial-results endpoint now returns HTTP 404.
+     * Market Lens exposes sector stock catalogues containing the screening fields,
+     * so we fetch each selected sector once and combine the rows locally.
+     */
+    private fun fetchAnnualFundamentals(universe: List<String>): FundamentalSummary = FundamentalSummary(screenerFundamentals, screenerFundamentals.size)
+
+    private fun filterByNseSectors(symbols: List<String>, selected: Set<String>): List<String> {
+        if (selected.size == 22) return symbols
+        val out=java.util.Collections.synchronizedList(mutableListOf<String>())
+        val futures=symbols.map { symbol -> sectorPool.submit(Callable { val sector=fetchNseSector(symbol); if (sector != null && sectorMatches(sector,selected)) out.add(symbol) }) }
+        futures.forEach { it.get() }
+        return out.sorted()
+    }
+
+    private fun fetchNseSector(symbol: String): String? {
+        sectorCache[symbol]?.let { return it }
+        var conn:HttpURLConnection?=null
+        try {
+            val url="https://www.nseindia.com/api/quote-equity?symbol="+java.net.URLEncoder.encode(symbol,"UTF-8")
+            conn=(URL(url).openConnection() as HttpURLConnection).apply { connectTimeout=7000; readTimeout=12000; requestMethod="GET"; setRequestProperty("User-Agent","Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36"); setRequestProperty("Accept","application/json,text/plain,*/*"); setRequestProperty("Referer","https://www.nseindia.com/get-quotes/equity?symbol=$symbol") }
+            if(conn.responseCode!=200) return null
+            val obj=JSONObject(conn.inputStream.use { it.bufferedReader().readText() })
+            val found=findJsonString(obj,"sector") ?: findJsonString(obj,"Sector")
+            if(found!=null) sectorCache[symbol]=found
+            return found
+        } catch(_:Exception) { return null } finally { conn?.disconnect() }
+    }
+
+    private fun findJsonString(value: Any?, wanted: String): String? {
+        if(value is JSONObject) { val keys=value.keys(); while(keys.hasNext()){ val k=keys.next(); val v=value.opt(k); if(normalize(k)==normalize(wanted) && v is String && v.isNotBlank()) return v.trim(); val nested=findJsonString(v,wanted); if(nested!=null) return nested } }
+        else if(value is JSONArray) for(i in 0 until value.length()){ val nested=findJsonString(value.opt(i),wanted); if(nested!=null) return nested }
+        return null
+    }
+
+    private fun marketLensUserAgent() =
+        "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36"
+
+    private fun runMarketLensQuery(query: String): List<JSONObject> {
+        // Next.js server-action identifiers can change when NSE deploys Market Lens.
+        // If the server rejects a query as unparsable, refresh the page/action once
+        // before reporting the error. This avoids using a stale action id from cache.
+        return try {
+            runMarketLensQueryOnce(query, discoverMarketLensAction())
+        } catch (first: Exception) {
+            marketLensAction = null
+            val refreshedAction = discoverMarketLensAction(forceRefresh = true)
+            runMarketLensQueryOnce(query, refreshedAction)
+        }
+    }
+
+    private fun runMarketLensQueryOnce(query: String, action: String): List<JSONObject> {
+        var conn: HttpURLConnection? = null
+        try {
+            conn = (URL("https://marketlens.nseindia.com/screener").openConnection() as HttpURLConnection).apply {
+                connectTimeout = 30000
+                readTimeout = 90000
+                useCaches = false
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("User-Agent", marketLensUserAgent())
+                setRequestProperty("Accept", "text/x-component")
+                setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+                setRequestProperty("Accept-Encoding", "gzip, deflate")
+                setRequestProperty("Content-Type", "text/plain;charset=UTF-8")
+                setRequestProperty("Origin", "https://marketlens.nseindia.com")
+                setRequestProperty("Referer", "https://marketlens.nseindia.com/screener")
+                setRequestProperty("Next-Action", action)
+                setRequestProperty("Cache-Control", "no-cache")
+                setRequestProperty("Pragma", "no-cache")
+                setRequestProperty("Sec-Fetch-Dest", "empty")
+                setRequestProperty("Sec-Fetch-Mode", "cors")
+                setRequestProperty("Sec-Fetch-Site", "same-origin")
+                marketLensCookies.cookieStore.getCookies().takeIf { it.isNotEmpty() }?.let { cookies ->
+                    setRequestProperty("Cookie", cookies.joinToString("; ") { "${it.name}=${it.value}" })
+                }
+            }
+            // The Market Lens server action expects exactly a JSON array containing
+            // the query string, matching the current web client request body.
+            val body = JSONArray().put(query).toString().toByteArray(Charsets.UTF_8)
+            conn.outputStream.use { it.write(body) }
+            val code = conn.responseCode
+            if (code !in 200..299) throw IllegalStateException("HTTP $code")
+            val input = conn.inputStream
+            val encoding = conn.contentEncoding?.lowercase(Locale.US)
+            val bytes = if (encoding == "gzip") GZIPInputStream(input).use { it.readBytes() } else input.use { it.readBytes() }
+            return parseMarketLensFlight(bytes)
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun discoverMarketLensAction(forceRefresh: Boolean = false): String {
+        if (!forceRefresh) marketLensAction?.let { return it }
+        val html = httpGetMarketLens("https://marketlens.nseindia.com/screener", forceRefresh)
+        val srcRegex = Regex("""<script\b[^>]*\bsrc=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+        val actionPatterns = listOf(
+            Regex("""createServerReference\)\("([0-9a-f]+)"[^;]{0,800}?"runStockQuery"""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)),
+            Regex("""createServerReference\)\('([0-9a-f]+)'[^;]{0,800}?'runStockQuery'""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        )
+        val base = "https://marketlens.nseindia.com"
+        // Some Next.js builds place the server-action reference in an inline chunk;
+        // check the HTML itself before downloading every external asset.
+        actionPatterns.firstNotNullOfOrNull { it.find(html) }?.let { match ->
+            marketLensAction = match.groupValues[1]
+            return marketLensAction!!
+        }
+        val scripts = srcRegex.findAll(html).map { it.groupValues[1] }.distinct()
+        for (src in scripts) {
+            if (!src.contains("/_next/static/")) continue
+            val asset = if (src.startsWith("http")) src else base + if (src.startsWith("/")) src else "/$src"
+            val js = try { httpGetMarketLens(asset) } catch (_: Exception) { continue }
+            val match = actionPatterns.firstNotNullOfOrNull { it.find(js) }
+            if (match != null) {
+                marketLensAction = match.groupValues[1]
+                return marketLensAction!!
+            }
+        }
+        throw IllegalStateException("Market Lens screener action could not be discovered")
+    }
+
+    private fun httpGetMarketLens(url: String, forceRefresh: Boolean = false): String {
+        var conn: HttpURLConnection? = null
+        try {
+            conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 15000
+                readTimeout = 30000
+                requestMethod = "GET"
+                useCaches = false
+                setRequestProperty("User-Agent", marketLensUserAgent())
+                setRequestProperty("Accept", "text/html,application/javascript,text/plain,*/*;q=0.8")
+                setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+                setRequestProperty("Accept-Encoding", "gzip, deflate")
+                setRequestProperty("Referer", "https://marketlens.nseindia.com/")
+                setRequestProperty("Cache-Control", if (forceRefresh) "no-cache" else "max-age=0")
+                setRequestProperty("Pragma", "no-cache")
+                marketLensCookies.cookieStore.getCookies().takeIf { it.isNotEmpty() }?.let { cookies ->
+                    setRequestProperty("Cookie", cookies.joinToString("; ") { "${it.name}=${it.value}" })
+                }
+            }
+            val code = conn.responseCode
+            if (code !in 200..399) throw IllegalStateException("HTTP $code while opening Market Lens")
+            marketLensCookies.put(conn.url.toURI(), conn.headerFields)
+            val input = conn.inputStream
+            val encoding = conn.contentEncoding?.lowercase(Locale.US)
+            return if (encoding == "gzip") {
+                GZIPInputStream(input).use { it.bufferedReader().readText() }
+            } else {
+                input.use { it.bufferedReader().readText() }
+            }
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun parseMarketLensFlight(bytes: ByteArray): List<JSONObject> {
+        val records = HashMap<String, Any?>()
+        var pos = 0
+        while (pos < bytes.size) {
+            while (pos < bytes.size && (bytes[pos] == '\n'.code.toByte() || bytes[pos] == '\r'.code.toByte())) pos++
+            if (pos >= bytes.size) break
+            var colon = pos
+            while (colon < bytes.size && bytes[colon] != ':'.code.toByte()) colon++
+            if (colon >= bytes.size) throw IllegalStateException("Invalid Market Lens response framing")
+            val id = bytes.copyOfRange(pos, colon).toString(Charsets.UTF_8)
+            pos = colon + 1
+            if (pos < bytes.size && bytes[pos] == 'T'.code.toByte()) {
+                var comma = pos + 1
+                while (comma < bytes.size && bytes[comma] != ','.code.toByte()) comma++
+                if (comma >= bytes.size) throw IllegalStateException("Invalid Market Lens text record")
+                val hex = bytes.copyOfRange(pos + 1, comma).toString(Charsets.UTF_8)
+                val len = hex.toIntOrNull(16) ?: throw IllegalStateException("Invalid Market Lens text length")
+                val start = comma + 1
+                val end = start + len
+                if (end > bytes.size) throw IllegalStateException("Truncated Market Lens response")
+                records[id] = bytes.copyOfRange(start, end).toString(Charsets.UTF_8)
+                pos = end
+            } else {
+                var end = pos
+                while (end < bytes.size && bytes[end] != '\n'.code.toByte()) end++
+                val line = bytes.copyOfRange(pos, end).toString(Charsets.UTF_8).trim()
+                if (line.isNotEmpty()) {
+                    records[id] = try { org.json.JSONTokener(line).nextValue() } catch (_: Exception) { line }
+                }
+                pos = if (end < bytes.size) end + 1 else end
+            }
+        }
+
+        val resolved = HashMap<String, Any?>()
+        for ((id, value) in records) resolved[id] = resolveMarketLensValue(value, records, HashSet())
+        val payload = resolved.values.firstOrNull { it is JSONObject && it.has("success") } as? JSONObject
+            ?: throw IllegalStateException("No Market Lens query result returned")
+        if (!payload.optBoolean("success", false)) {
+            throw IllegalStateException(payload.optString("error", "Market Lens query failed"))
+        }
+        val data = payload.opt("data")
+        val rows = when (data) {
+            is JSONObject -> data.optJSONArray("stocks")
+            is JSONArray -> data
+            else -> payload.optJSONArray("stocks")
+        } ?: throw IllegalStateException("Market Lens returned no stock rows")
+        val meta = if (data is JSONObject) data.optJSONObject("meta") else payload.optJSONObject("meta")
+        if (meta?.optBoolean("hasMore", false) == true) {
+            throw IllegalStateException("Market Lens returned incomplete results")
+        }
+        val out = ArrayList<JSONObject>(rows.length())
+        for (i in 0 until rows.length()) rows.optJSONObject(i)?.let { out.add(it) }
+        return out
+    }
+
+    private fun resolveMarketLensValue(value: Any?, records: Map<String, Any?>, seen: MutableSet<String>): Any? {
+        if (value is String) {
+            if (value.startsWith("$$")) return value.substring(1)
+            if (value.startsWith("$")) {
+                val ref = value.removePrefix("$").removePrefix("@")
+                if (ref.isNotEmpty() && seen.add(ref)) return resolveMarketLensValue(records[ref], records, seen)
+            }
+            return value
+        }
+        if (value is JSONObject) {
+            val keys = value.keys().asSequence().toList()
+            for (key in keys) value.put(key, resolveMarketLensValue(value.opt(key), records, seen))
+            return value
+        }
+        if (value is JSONArray) {
+            for (i in 0 until value.length()) value.put(i, resolveMarketLensValue(value.opt(i), records, seen))
+            return value
+        }
+        return value
+    }
+
+    private fun sectorMatches(sector: String, selected: Set<String>): Boolean {
+        val a = normalize(sector)
+        return selected.any { b0 ->
+            val b = normalize(b0)
+            a == b || a.contains(b) || b.contains(a)
+        }
+    }
+
+    private fun findSymbol(obj: JSONObject, wanted: Set<String>): String? {
+        val names = listOf("symbol", "Symbol", "SYMBOL", "ticker", "Ticker", "nseSymbol", "NSE Symbol")
+        for (name in names) {
+            val s = obj.optString(name, "").trim().uppercase(Locale.US)
+            if (s in wanted) return s
+        }
+        return null
+    }
+
+    private fun extractFundamental(obj: JSONObject): Fundamental {
+        var de: Double? = null
+        var ic: Double? = null
+        var roce: Double? = null
+        var pledge: Double? = null
+        var sector: String? = null
+        val it = obj.keys()
+        while (it.hasNext()) {
+            val key = it.next()
+            val norm = normalize(key)
+            val value = obj.opt(key)
+            val num = when (value) {
+                is Number -> value.toDouble()
+                is String -> parseDouble(value)
+                else -> null
+            }
+            if (num != null) {
+                if (norm.contains("DEBTEQUITY") || norm == "DERATIO" || norm == "DEBTEQUITYRATIO" || norm == "DEBTEQ") de = num
+                if (norm.contains("INTERESTCOVERAGE") || norm.contains("INTERESTSERVICECOVERAGE") || norm == "ICRATIO" || norm == "INTERESTCOVER") ic = num
+                if (norm.contains("ROCE") || norm.contains("RETURNOFCAPITALEMPLOYED") || norm == "RETURNONCAPITALEMPLOYED") roce = num
+                if (norm.contains("PLEDGE") && (norm.contains("PCT") || norm.contains("PERCENT") || norm.contains("SHARES") || norm.contains("PROMOTER"))) pledge = num
+            }
+            if (value is String && (norm == "SECTOR" || norm == "SECTORNAME" || norm.contains("INDUSTRY"))) sector = value.trim()
+        }
+        return Fundamental(de, ic, roce, pledge, sector)
+    }
+
+    private fun mergeFundamental(old: Fundamental?, new: Fundamental): Fundamental = Fundamental(
+        new.debtEquity ?: old?.debtEquity,
+        new.interestCoverage ?: old?.interestCoverage,
+        new.roce ?: old?.roce,
+        new.pledgePct ?: old?.pledgePct,
+        new.sector ?: old?.sector
+    )
 
     private fun selectedMarketRange(): Pair<Calendar, Calendar> {
         val end = Calendar.getInstance().apply { set(Calendar.HOUR_OF_DAY,0); set(Calendar.MINUTE,0); set(Calendar.SECOND,0); set(Calendar.MILLISECOND,0) }
@@ -431,8 +854,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun renderMarketResults(results: List<StockResult>, from: Calendar, to: Calendar, conditions: List<RatioCondition>, universeSize: Int) {
+    private fun renderMarketResults(results: List<StockResult>, from: Calendar, to: Calendar, conditions: List<RatioCondition>, universeSize: Int, fundamentals: FundamentalSummary?) {
         marketResultsContainer.removeAllViews()
+        if (fundamentals != null) {
+            marketResultsContainer.addView(TextView(this).apply {
+                text = "Fundamentals: ${fundamentals.passedCount} / $universeSize passed selected yearly filters"
+                textSize = 13f; setTypeface(null, android.graphics.Typeface.BOLD); setPadding(dp(6), dp(4), dp(6), dp(8))
+            })
+        }
         marketResultsContainer.addView(TextView(this).apply {
             text = "NSE Full Market • ${dateFormat.format(from.time)} → ${dateFormat.format(to.time)}\nStocks in universe: $universeSize • Stocks with data: ${results.size}"
             textSize = 13f; setPadding(dp(6), dp(2), dp(6), dp(10))
@@ -787,6 +1216,35 @@ class MainActivity : AppCompatActivity() {
         thresholdSpinner.setSelection(prefs.getInt("threshold", 1).coerceIn(0, thresholdSpinner.count - 1))
         prefs.getLong("from", 0L).takeIf { it > 0 }?.let { fromDate = Calendar.getInstance().apply { timeInMillis = it }; fromDateButton.text = "From: ${dateFormat.format(fromDate!!.time)}" }
         prefs.getLong("to", 0L).takeIf { it > 0 }?.let { toDate = Calendar.getInstance().apply { timeInMillis = it }; toDateButton.text = "To: ${dateFormat.format(toDate!!.time)}" }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode,resultCode,data)
+        if(requestCode==PICK_SCREENER && resultCode==RESULT_OK) {
+            val uri=data?.data ?: return
+            try {
+                val bytes=contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: throw IllegalStateException("Could not read CSV")
+                screenerFundamentals=parseScreenerCsv(ByteArrayInputStream(bytes))
+                screenerStatus.text="Loaded ${screenerFundamentals.size} stocks"
+                toast("Screener CSV loaded")
+            } catch(e:Exception) { toast("CSV error: ${e.message ?: "invalid file"}") }
+        }
+    }
+
+    private fun parseScreenerCsv(input: InputStream): Map<String, Fundamental> {
+        BufferedReader(InputStreamReader(input)).use { br ->
+            val header=br.readLine() ?: throw IllegalStateException("CSV is empty")
+            val h=parseCsv(header).mapIndexed { i,s -> normalize(s) to i }.toMap()
+            fun idx(vararg names:String):Int? = names.firstNotNullOfOrNull { h[normalize(it)] }
+            val sym=idx("NSE Code","NSE Symbol","NSE Code","Symbol","Ticker") ?: throw IllegalStateException("NSE Code/Symbol column not found")
+            val de=idx("Debt to Equity","Debt / Equity","Debt to Eq","Debt/Equity","Debt Eq")
+            val ic=idx("Interest Coverage Ratio","Interest Coverage","Interest Coverage Ratio")
+            val roce=idx("ROCE","Return on Capital Employed")
+            val pledge=idx("Pledged percentage","Pledge %","Pledged %","Pledge percentage","Pledge")
+            val out=linkedMapOf<String,Fundamental>()
+            while(true){ val line=br.readLine() ?: break; val c=parseCsv(line); if(c.size<=sym) continue; val s=c[sym].trim().uppercase(Locale.US); if(s.isEmpty()) continue; out[s]=Fundamental(de?.let{c.getOrNull(it)?.let(::parseDouble)},ic?.let{c.getOrNull(it)?.let(::parseDouble)},roce?.let{c.getOrNull(it)?.let(::parseDouble)},pledge?.let{c.getOrNull(it)?.let(::parseDouble)},null) }
+            return out
+        }
     }
 
     private fun parseDouble(s: String) = s.trim().replace(",", "").toDoubleOrNull()
